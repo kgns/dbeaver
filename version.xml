@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<version>
+  <name>DBeaver Community</name>
+  <number>26.0.5</number>
+  <date>18.05.2026</date>
+  <base-url>https://github.com/kgns/dbeaver/releases/tag/26.0.5</base-url>
+  <download-url>https://github.com/kgns/dbeaver/releases/download/26.0.5</download-url>
+  <release-notes>https://github.com/kgns/dbeaver/releases/tag/26.0.5</release-notes>
+</version>
