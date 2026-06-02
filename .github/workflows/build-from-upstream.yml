@@ -1,0 +1,270 @@
+name: Build from upstream release
+
+on:
+  schedule:
+    # Sundays 20:00 UTC
+    - cron: '0 20 * * 0'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream tag to build (empty = latest release)'
+        required: false
+      force:
+        description: 'Build even if a release with this tag already exists on the fork'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-from-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: dbeaver/dbeaver
+  CUSTOM_BRANCH: feature/password-provider-command
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Resolve upstream tag and check fork releases
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.upstream_tag }}" ]; then
+            TAG="${{ inputs.upstream_tag }}"
+          else
+            TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)
+          fi
+          echo "Upstream tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "Force flag set, will build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG already exists on the fork, skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      UPSTREAM_TAG: ${{ needs.check-upstream.outputs.tag }}
+    steps:
+      - name: Checkout fork (custom branch)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.CUSTOM_BRANCH }}
+          path: dbeaver
+          fetch-depth: 0
+
+      - name: Checkout sibling dependencies (matched to upstream release)
+        run: |
+          set -euo pipefail
+          VER="${UPSTREAM_TAG#v}"
+          BRANCH="release_$(echo "$VER" | tr '.' '_')"   # x.y.z -> release_x_y_z
+          echo "Target sibling branch: $BRANCH"
+          for repo in dbeaver-common dbeaver-jdbc-libsql; do
+            url="https://github.com/dbeaver/$repo.git"
+            if git ls-remote --exit-code --heads "$url" "$BRANCH" >/dev/null 2>&1; then
+              ref="$BRANCH"
+            else
+              echo "::warning::$repo has no $BRANCH branch; falling back to devel"
+              ref="devel"
+            fi
+            echo "Cloning $repo @ $ref"
+            git clone --depth 1 -b "$ref" "$url"
+          done
+
+      - name: Merge upstream tag into custom branch (fail on conflict)
+        working-directory: dbeaver
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --force --no-tags upstream "refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}"
+          if ! git merge --no-edit --no-ff "${UPSTREAM_TAG}"; then
+            echo "::error::Merge conflict between upstream ${UPSTREAM_TAG} and ${CUSTOM_BRANCH}. Resolve manually and re-run."
+            git merge --abort || true
+            exit 1
+          fi
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Cache Maven repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('dbeaver/**/pom.xml') }}
+          restore-keys: maven-${{ runner.os }}-
+
+      - name: Build (Tycho produces all platform binaries)
+        working-directory: dbeaver/product/aggregate
+        run: |
+          set -euo pipefail
+          mvn -B clean verify \
+            -Pproduct-dbeaver-ce,product-dbeaver-eclipse-ce \
+            -DskipTests
+
+      - name: Bundle Adoptium Temurin JRE 21 per platform
+        working-directory: dbeaver
+        run: |
+          set -euo pipefail
+          PRODUCT_DIR="product/community/target/products/org.jkiss.dbeaver.core.product"
+
+          # $1 = adoptium os    (linux | mac | windows)
+          # $2 = adoptium arch  (x64   | aarch64)
+          # $3 = destination path for the JRE dir, relative to $PRODUCT_DIR
+          inject_jre() {
+            local os_api="$1" arch_api="$2" dest_rel="$3"
+            local url="https://api.adoptium.net/v3/binary/latest/21/ga/${os_api}/${arch_api}/jre/hotspot/normal/eclipse"
+            local tmp; tmp="$(mktemp -d)"
+            echo "Downloading Temurin JRE 21 (${os_api}/${arch_api})"
+            if [ "$os_api" = "windows" ]; then
+              curl -sSL -o "$tmp/jre.zip" "$url"
+              unzip -q "$tmp/jre.zip" -d "$tmp/extract"
+            else
+              curl -sSL -o "$tmp/jre.tar.gz" "$url"
+              mkdir -p "$tmp/extract"
+              tar -xzf "$tmp/jre.tar.gz" -C "$tmp/extract"
+            fi
+            local top; top="$(ls "$tmp/extract" | head -n 1)"
+            mkdir -p "$(dirname "$PRODUCT_DIR/$dest_rel")"
+            mv "$tmp/extract/$top" "$PRODUCT_DIR/$dest_rel"
+            rm -rf "$tmp"
+            echo "Injected: $PRODUCT_DIR/$dest_rel"
+          }
+
+          # Linux/Windows launchers auto-discover a `jre/` sibling of the executable.
+          # macOS launcher uses the explicit -vm path from DBeaver.product (line 13):
+          #   ../Eclipse/jre/Contents/Home/lib/libjli.dylib
+          # Adoptium's mac archive already has the Contents/Home layout, so renaming
+          # its top-level dir to `jre` lands the libjli.dylib at exactly that path.
+          inject_jre linux   x64      linux/gtk/x86_64/dbeaver/jre
+          inject_jre linux   aarch64  linux/gtk/aarch64/dbeaver/jre
+          inject_jre mac     x64      macosx/cocoa/x86_64/DBeaver.app/Contents/Eclipse/jre
+          inject_jre mac     aarch64  macosx/cocoa/aarch64/DBeaver.app/Contents/Eclipse/jre
+          inject_jre windows x64      win32/win32/x86_64/dbeaver/jre
+          inject_jre windows aarch64  win32/win32/aarch64/dbeaver/jre
+
+      - name: Package per-platform archives
+        id: package
+        working-directory: dbeaver
+        run: |
+          set -euo pipefail
+          PRODUCT_DIR="product/community/target/products/org.jkiss.dbeaver.core.product"
+          if [ ! -d "$PRODUCT_DIR" ]; then
+            echo "::error::Product output not found at $PRODUCT_DIR"
+            ls -la product/community/target/ || true
+            exit 1
+          fi
+          OUT="$GITHUB_WORKSPACE/release-assets"
+          mkdir -p "$OUT"
+          VERSION="${UPSTREAM_TAG#v}"
+          cd "$PRODUCT_DIR"
+          shopt -s nullglob
+          # Layout: <os>/<ws>/<arch>/...  (e.g. linux/gtk/x86_64, win32/win32/x86_64, macosx/cocoa/aarch64)
+          for os_dir in */; do
+            os="${os_dir%/}"
+            for ws_dir in "$os_dir"*/; do
+              for arch_dir in "$ws_dir"*/; do
+                arch="$(basename "$arch_dir")"
+                # Normalise OS label for filename
+                case "$os" in
+                  win32)   label="windows-${arch}" ; ext="zip" ;;
+                  macosx)  label="macos-${arch}"   ; ext="tar.gz" ;;
+                  linux)   label="linux-${arch}"   ; ext="tar.gz" ;;
+                  *)       label="${os}-${arch}"   ; ext="tar.gz" ;;
+                esac
+                archive="$OUT/dbeaver-ce-${VERSION}-${label}.${ext}"
+                echo "Packaging $arch_dir → $archive"
+                if [ "$ext" = "zip" ]; then
+                  (cd "$arch_dir" && zip -rq "$archive" .)
+                else
+                  tar -C "$arch_dir" -czf "$archive" .
+                fi
+              done
+            done
+          done
+          ls -la "$OUT"
+
+      - name: Generate version.xml
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          DATE="$(date -u '+%d.%m.%Y')"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${UPSTREAM_TAG}"
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${UPSTREAM_TAG}"
+          mkdir -p site
+          cat > site/version.xml <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <version>
+            <name>DBeaver Community</name>
+            <number>${VERSION}</number>
+            <date>${DATE}</date>
+            <base-url>${RELEASE_URL}</base-url>
+            <download-url>${DOWNLOAD_URL}</download-url>
+            <release-notes>${RELEASE_URL}</release-notes>
+          </version>
+          EOF
+          cat site/version.xml
+
+      - name: Create GitHub release with installers
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Delete any pre-existing release with this tag so re-runs are idempotent.
+          # Keep the underlying git tag (no --cleanup-tag) since we want to reattach to it.
+          gh release delete "${UPSTREAM_TAG}" -R "${{ github.repository }}" --yes 2>/dev/null || true
+          gh release create "${UPSTREAM_TAG}" release-assets/* \
+            -R "${{ github.repository }}" \
+            --title "DBeaver ${UPSTREAM_TAG}" \
+            --notes "Build of upstream [${UPSTREAM_REPO}@${UPSTREAM_TAG}](https://github.com/${UPSTREAM_REPO}/releases/tag/${UPSTREAM_TAG}) with \`${CUSTOM_BRANCH}\` applied on top."
+
+      - name: Publish version.xml to gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          mkdir gh-pages-work
+          cd gh-pages-work
+          git init -q -b gh-pages
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add origin "$REPO_URL"
+          # Try to base on existing gh-pages so history is preserved; if branch doesn't exist, start fresh.
+          if git fetch --depth 1 origin gh-pages 2>/dev/null; then
+            git reset --hard FETCH_HEAD
+          fi
+          cp ../site/version.xml ./version.xml
+          git add version.xml
+          if git diff --cached --quiet; then
+            echo "version.xml unchanged, nothing to publish."
+          else
+            git commit -m "Update version.xml to ${UPSTREAM_TAG}"
+            git push origin gh-pages
+          fi
